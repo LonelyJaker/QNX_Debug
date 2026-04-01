@@ -1,0 +1,22 @@
+```
+# Build artifacts
+build/
+dist/
+
+# Python compiled files
+*.pyc
+__pycache__/
+localpycs/
+
+# PyInstaller files
+*.spec
+*.toc
+*.pkg
+*.pyz
+warn-*.txt
+xref-*.html
+base_library.zip
+
+# Logs
+*.log
+```
