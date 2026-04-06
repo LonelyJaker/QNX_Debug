@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
 QNX Automation Tool
-Connects to QNX device via ADB and Telnet, executes shell commands.
-Supports interactive mode with real-time output.
+Connects to QNX device via ADB and Telnet (using busybox), executes shell commands.
+Uses pexpect for interactive telnet session management.
 """
 
 import subprocess
 import sys
 import time
 import argparse
-import select
 import os
 from typing import Optional, List
+
+try:
+    import pexpect
+except ImportError:
+    print("Error: pexpect library is required. Install with: pip install pexpect")
+    sys.exit(1)
 
 
 class QNXAutomation:
@@ -25,7 +30,7 @@ class QNXAutomation:
         self.username = username
         self.password = password
         self.verbose = verbose
-        self.telnet_process: Optional[subprocess.Popen] = None
+        self.telnet_process: Optional[pexpect.spawn] = None
         self.adb_started = False
     
     def start_adb_server(self) -> bool:
@@ -120,84 +125,89 @@ class QNXAutomation:
             return False
     
     def connect_telnet_interactive(self) -> bool:
-        """Connect to QNX via telnet using busybox in interactive mode"""
+        """Connect to QNX via telnet using busybox in interactive mode with pexpect"""
         print(f"[*] Connecting to telnet {self.telnet_ip}:{self.telnet_port}")
         
         try:
-            # Start telnet process via adb shell
+            # Start telnet process via adb shell using pexpect
             cmd = f"adb shell busybox telnet {self.telnet_ip} {self.telnet_port}"
-            self.telnet_process = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
+            self.telnet_process = pexpect.spawn(cmd, encoding='utf-8', timeout=30)
             
-            time.sleep(2)  # Wait for connection prompt
+            if self.verbose:
+                self.telnet_process.logfile_read = sys.stdout
+            
+            # Wait for login prompt
+            if self.verbose:
+                print("[*] Waiting for login prompt...")
+            index = self.telnet_process.expect(['login:', 'Login:', 'ogin:', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+            
+            if index in [3, 4]:  # TIMEOUT or EOF
+                print("[-] Failed to get login prompt")
+                return False
             
             # Send username
-            if self.telnet_process.stdin:
-                if self.verbose:
-                    print(f"[*] Sending username: {self.username}")
-                self.telnet_process.stdin.write(self.username + "\n")
-                self.telnet_process.stdin.flush()
+            if self.verbose:
+                print(f"[*] Sending username: {self.username}")
+            self.telnet_process.sendline(self.username)
             
-            time.sleep(1)
+            # Wait for password prompt
+            if self.verbose:
+                print("[*] Waiting for password prompt...")
+            index = self.telnet_process.expect(['Password:', 'password:', 'ssword:', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+            
+            if index in [3, 4]:  # TIMEOUT or EOF
+                print("[-] Failed to get password prompt")
+                return False
             
             # Send password
-            if self.telnet_process.stdin:
-                if self.verbose:
-                    print("[*] Sending password...")
-                self.telnet_process.stdin.write(self.password + "\n")
-                self.telnet_process.stdin.flush()
+            if self.verbose:
+                print("[*] Sending password...")
+            self.telnet_process.sendline(self.password)
             
-            time.sleep(2)
+            # Wait for successful login (shell prompt)
+            if self.verbose:
+                print("[*] Waiting for shell prompt...")
+            index = self.telnet_process.expect(['#', '$', '>', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+            
+            if index in [3, 4]:  # TIMEOUT or EOF
+                print("[-] Login failed - incorrect credentials or connection issue")
+                return False
             
             print("[+] Telnet connection established")
             return True
             
+        except pexpect.ExceptionPexpect as e:
+            print(f"[-] Telnet connection failed: {e}")
+            return False
         except Exception as e:
             print(f"[-] Telnet connection failed: {e}")
             return False
     
     def execute_command(self, command: str, timeout: float = 5.0) -> str:
         """Execute a command on the QNX device and wait for output"""
-        if not self.telnet_process or not self.telnet_process.stdin:
+        if not self.telnet_process:
             return "Error: Not connected to QNX"
         
         if self.verbose:
             print(f"[*] Executing: {command}")
         
         try:
-            self.telnet_process.stdin.write(command + "\n")
-            self.telnet_process.stdin.flush()
+            # Send command
+            self.telnet_process.sendline(command)
             
-            # Read output with timeout
-            output = ""
-            start_time = time.time()
+            # Wait for output and next prompt
+            patterns = ['#', '$', '>']
+            index = self.telnet_process.expect(patterns + [pexpect.TIMEOUT], timeout=timeout)
             
-            while time.time() - start_time < timeout:
-                if self.telnet_process.stdout:
-                    ready, _, _ = select.select([self.telnet_process.stdout], [], [], 0.5)
-                    if ready:
-                        line = self.telnet_process.stdout.readline()
-                        if line:
-                            output += line
-                        else:
-                            break
-                    else:
-                        # No more data available, check if we got something
-                        if output.strip():
-                            break
-                else:
-                    break
+            if index == len(patterns):  # TIMEOUT
+                return self.telnet_process.before if self.telnet_process.before else "Command executed (no output)"
             
-            return output if output.strip() else "Command executed (no output)"
+            # Return the output (before the prompt)
+            output = self.telnet_process.before
+            return output if output else "Command executed (no output)"
             
+        except pexpect.ExceptionPexpect as e:
+            return f"Error executing command: {e}"
         except Exception as e:
             return f"Error executing command: {e}"
     
@@ -241,18 +251,17 @@ class QNXAutomation:
         if self.telnet_process:
             print("\n[*] Disconnecting...")
             try:
-                if self.telnet_process.stdin:
-                    self.telnet_process.stdin.write("exit\n")
-                    self.telnet_process.stdin.flush()
-                    time.sleep(0.5)
-            except:
-                pass
-            
-            try:
-                self.telnet_process.terminate()
-                self.telnet_process.wait(timeout=3)
-            except:
-                self.telnet_process.kill()
+                # Send exit command
+                self.telnet_process.sendline("exit")
+                time.sleep(0.5)
+                
+                # Close the pexpect process
+                self.telnet_process.close()
+            except Exception as e:
+                try:
+                    self.telnet_process.kill(9)
+                except:
+                    pass
             
             self.telnet_process = None
             print("[+] Disconnected")
