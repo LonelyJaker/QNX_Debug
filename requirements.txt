@@ -1,2 +1,2 @@
 # QNX Automation Tool Requirements
-# No external dependencies required - uses only Python standard library
+pexpect>=4.8.0
